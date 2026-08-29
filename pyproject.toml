@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "event-platform"
+version = "0.1.0"
+description = "Distributed Event Processing Platform - async ingestion, MongoDB storage, Elasticsearch search, Redis caching"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.110,<1.0",
+    "uvicorn[standard]>=0.29",
+    "pymongo>=4.13,<5.0",
+    "elasticsearch[async]>=8.13,<9.0",
+    "redis>=5.0,<7.0",
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.2,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23,<0.24",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires MongoDB, Elasticsearch and Redis to be reachable",
+]
