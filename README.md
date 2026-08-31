@@ -174,11 +174,11 @@ queue saturation point and validate backpressure under burst; and
 
 ## AI in My Workflow
 
-AI (Cursor with Claude) was used as an architectural sparring partner and
+AI (Cursor with Grok 4.5 and Fable 5) was used as an architectural sparring partner and
 force multiplier throughout, under a project rule requiring it to present
 two alternatives with pros/cons for every significant design decision.
 
-**Tools used:** Cursor (agent mode) with Claude, configured with
+**Tools used:** Cursor (agent mode) with Grok 4.5 and Fable 5, configured with
 project-specific rules (`.cursorrules`) and custom skills (`.cursor/skills/`)
 encoding the assessment constraints, module boundaries, and a requirements
 checklist.
