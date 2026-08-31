@@ -12,6 +12,7 @@ teardown) and Redis db 15 is flushed, so runs never pollute dev data.
 import asyncio
 import os
 import uuid
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -65,8 +66,13 @@ def settings() -> Settings:
     )
 
 
-@pytest.fixture
-async def client(settings):
+@asynccontextmanager
+async def running_app(settings: Settings):
+    """Run the full app (lifespan, worker, stores) and yield an HTTP client.
+
+    Reused by fixtures that need non-default settings (backpressure, rate
+    limiting, chaos). Cleans up the per-run database/index/Redis db.
+    """
     if not await _services_reachable():
         pytest.skip("MongoDB/Elasticsearch/Redis not reachable; start docker-compose services")
 
@@ -88,6 +94,12 @@ async def client(settings):
     redis = Redis.from_url(settings.redis_url)
     await redis.flushdb()
     await redis.aclose()
+
+
+@pytest.fixture
+async def client(settings):
+    async with running_app(settings) as c:
+        yield c
 
 
 async def poll_until(check, timeout: float = 15.0, interval: float = 0.2):

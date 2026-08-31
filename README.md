@@ -130,10 +130,14 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 # Integration tests — need the stores running:
 docker compose up -d mongo elasticsearch redis
-.venv/bin/pytest tests/integration
+.venv/bin/pytest tests/integration -m "not chaos"
 
-# Everything (integration auto-skips if services are unreachable)
-.venv/bin/pytest
+# Chaos tests — pause/unpause the docker containers mid-test to verify the
+# failure modes documented in ARCHITECTURE.md (opt-in):
+CHAOS=1 .venv/bin/pytest -m chaos
+
+# Everything non-chaos (integration auto-skips if services are unreachable)
+.venv/bin/pytest -m "not chaos"
 ```
 
 Integration tests create a uniquely-named Mongo database and ES index per run
@@ -150,18 +154,23 @@ data, not at a line-count number:
   blocking ingestion, cache single-flight and Redis fail-open, rate-limit
   windows, and the validation contract. They run in ~3 seconds, which keeps
   them in the inner dev loop.
-- **Integration tests** cover five full lifecycles against real stores —
+- **Integration tests** cover full lifecycles against real stores —
   ingest→query, ingest→stats buckets, ingest→search, realtime cache
-  MISS→HIT, and dependency health — because the riskiest bugs (aggregation
-  pipeline shape, ES mapping behavior, serialization across the queue
-  boundary) only show up against real engines.
+  MISS→HIT, end-to-end idempotency (duplicate `event_id` stored once;
+  identical payloads without one deliberately stored twice), queue
+  backpressure (503), rate limiting (429), and dependency health — because
+  the riskiest bugs (aggregation pipeline shape, ES mapping behavior,
+  serialization across the queue boundary) only show up against real engines.
+- **Chaos tests** (`CHAOS=1 pytest -m chaos`) make the failure-mode table in
+  ARCHITECTURE.md executable rather than prose: they pause the Mongo /
+  Elasticsearch / Redis containers mid-test and assert the documented
+  degradation actually happens — transient Mongo outage → retried, stored
+  exactly once, no DLQ; ES outage → only search degrades; Redis outage →
+  cache bypass and fail-open everywhere.
 
-With more time I'd prioritize, in order: **chaos-style tests** that kill
-Mongo/ES containers mid-run and assert the documented degradation actually
-happens (the failure-mode table in ARCHITECTURE.md should be executable, not
-prose); **load tests** to find the real queue saturation point and validate
-backpressure under burst; and **property-based tests** (hypothesis) on the
-validation and dedup logic.
+With more time I'd prioritize, in order: **load tests** to find the real
+queue saturation point and validate backpressure under burst; and
+**property-based tests** (hypothesis) on the validation and dedup logic.
 
 ## AI in My Workflow
 
@@ -197,7 +206,19 @@ checklist.
 
 **Where I pushed back or corrected AI output:**
 
-- **A real bug the tests caught in AI-written code:** the realtime TTL
+- **A serious ordering bug found by human review of AI-written code:** the
+  worker originally took its Redis dedup claim (SETNX) *before* the Mongo
+  write. On a transient Mongo failure, the retry found the claim from its own
+  failed attempt and dropped the event as a "duplicate" — silent data loss on
+  the retry path. Worse, AI's own unit tests passed, because the
+  `FakeDeduplicator` returned success on every claim instead of modeling real
+  SETNX semantics — the fake hid the bug it was supposed to catch. Reviewing
+  the idempotency boundary myself surfaced it. The fix is the classic
+  idempotent-consumer shape (check-before-write, mark-after-durable-write,
+  unique index as the atomic tiebreaker), the fake now keeps real state, and
+  a chaos test that pauses the Mongo container mid-ingest pins the scenario
+  end-to-end.
+- **A bug the tests caught in AI-written code:** the realtime TTL
   override used `ttl_override or default`, which silently swallowed an
   invalid `ttl=0` instead of rejecting it (0 is falsy). The unit test
   parametrized on boundary values exposed it; the fix is an explicit
@@ -212,7 +233,8 @@ checklist.
   to ARCHITECTURE.md's "what I'd do differently" instead of the code.
 
 **Impact on speed and quality:** the full system (pipeline, three storage
-integrations, 47 tests, Docker setup, and the architecture document) was
+integrations, 60+ tests including a chaos suite, Docker setup, and the
+architecture document) was
 built in a small fraction of the time a solo implementation would take. More
 importantly, the "always present two alternatives" rule meant every layer has
 a *considered* design with the rejected option documented — the architecture

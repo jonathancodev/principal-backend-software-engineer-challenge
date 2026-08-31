@@ -38,13 +38,26 @@ class FakeSearchStore:
 
 
 class FakeDeduplicator:
-    def __init__(self, duplicates: Optional[set] = None) -> None:
-        self.duplicates = duplicates or set()
-        self.claimed: List[str] = []
+    """Stateful fake matching RedisDeduplicator's real semantics.
 
-    async def claim(self, event_id: str) -> bool:
-        self.claimed.append(event_id)
-        return event_id not in self.duplicates
+    The original fake returned True on every claim regardless of history,
+    which hid a real ordering bug in the worker (a pre-write claim made
+    retries look like duplicates). This one keeps actual state so tests
+    exercise the same seen/mark contract the Redis implementation has.
+    """
+
+    def __init__(self, seen_ids: Optional[set] = None) -> None:
+        self.seen_ids = set(seen_ids or ())
+        self.checks: List[str] = []
+        self.marks: List[str] = []
+
+    async def seen(self, event_id: str) -> bool:
+        self.checks.append(event_id)
+        return event_id in self.seen_ids
+
+    async def mark(self, event_id: str) -> None:
+        self.marks.append(event_id)
+        self.seen_ids.add(event_id)
 
 
 class FakeRedis:

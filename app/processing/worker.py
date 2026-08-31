@@ -1,16 +1,23 @@
 """Background worker: consumes the queue and persists events.
 
-Per-message flow:
-    receive -> dedup claim -> Mongo insert (authoritative) -> ES index (best-effort) -> ack
+Per-message flow (idempotent consumer):
+    receive -> dedup seen? -> Mongo insert (authoritative) -> dedup mark
+            -> ES index (best-effort) -> ack
+
+Ordering is load-bearing: the dedup marker is written only *after* the
+durable Mongo write, so a failed attempt leaves no dedup residue and retries
+are never misclassified as duplicates. (An earlier claim-before-write version
+silently dropped events on retry — caught in review, kept as a regression
+test in tests/unit/test_worker.py.)
 
 Failure policy:
 - Mongo failure: nack with exponential backoff (base * 2^(attempt-1), capped).
   After ``max_retries`` receives the message moves to the DLQ.
 - ES failure: logged and skipped — search lags but ingestion is never blocked
   by the search tier (Mongo remains the source of truth).
-- Duplicate (Redis claim lost or Mongo unique index hit): ack and drop.
+- Duplicate (dedup marker present or Mongo unique index hit): ack and drop.
 - Crash mid-message: no ack happens, so the queue's visibility timeout
-  redelivers; dedup + unique index prevent double-writes.
+  redelivers; the dedup marker + unique index prevent double-writes.
 """
 
 import asyncio
@@ -80,7 +87,7 @@ class EventWorker:
     async def process_message(self, message: QueueMessage) -> None:
         record = EventRecord.model_validate(message.body)
 
-        if not await self._dedup.claim(record.event_id):
+        if await self._dedup.seen(record.event_id):
             logger.info("duplicate skipped event_id=%s", record.event_id)
             await self._queue.ack(message.receipt_handle)
             return
@@ -88,16 +95,22 @@ class EventWorker:
         try:
             await self._repository.insert_event(record)
         except DuplicateEventError:
+            # Lost the insert race to a concurrent delivery; backfill the fast path.
             logger.info("duplicate at storage layer skipped event_id=%s", record.event_id)
+            await self._dedup.mark(record.event_id)
             await self._queue.ack(message.receipt_handle)
             return
         except StorageUnavailableError as exc:
+            # Nothing marked: the retry must not look like a duplicate.
             logger.warning(
                 "mongo write failed event_id=%s attempt=%d error=%s",
                 record.event_id, message.attempts, exc,
             )
             await self._handle_failure(message, f"storage unavailable: {exc}")
             return
+
+        # Mark only after the durable write; a redelivery from here on is a duplicate.
+        await self._dedup.mark(record.event_id)
 
         if self._search_store is not None:
             try:

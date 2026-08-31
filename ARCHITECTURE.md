@@ -66,9 +66,18 @@ lifetime**; bounded memory; per-message receive counts.
 messages), cross-process scaling, strict ordering after retries. These gaps
 are exactly what real SQS would close — see "SQS drop-in notes" below.
 
-**Worker.** Owns the write pipeline: dedup claim → Mongo insert
+**Worker.** Owns the write pipeline: dedup check ("seen?") → Mongo insert
 (authoritative, retried with exponential backoff, dead-lettered after
-`max_retries`) → Elasticsearch index (best-effort) → ack. Runs as N asyncio
+`max_retries`) → dedup mark → Elasticsearch index (best-effort) → ack. The
+ordering is load-bearing: the dedup marker is written only *after* the
+durable Mongo write, so a failed attempt leaves no marker and its retry is
+never misclassified as a duplicate. (An earlier claim-before-write design had
+exactly that flaw — a transient Mongo outage caused retries to be dropped as
+"duplicates". It was caught in review and is now pinned by both a unit
+regression test and a chaos test that pauses the Mongo container.) Two
+concurrent deliveries can both pass the "seen" check; that race is resolved
+atomically by the unique index on `event_id` — Redis is the fast path, the
+index is the guarantee. The worker runs as N asyncio
 tasks inside the API process (configurable via `WORKER_CONCURRENCY`), which is
 honest to the "simulated queue" constraint; in production it would be a
 separate deployable so ingestion and query traffic don't share a failure
@@ -119,7 +128,7 @@ right trade for an event platform.
 | Failure | System behavior | Client impact | Recovery |
 |---|---|---|---|
 | **MongoDB down** | Worker retries with exponential backoff (0.5s → 30s cap); events accumulate in the queue; after `max_retries` receives a message goes to the DLQ. Reads raise `StorageUnavailableError` → 503. Ingestion keeps accepting until the queue fills, then 503 + `Retry-After`. | Writes: accepted (202) until queue capacity, then 503. Reads: 503. | Mongo returns → worker drains the backlog. DLQ'd events are inspectable at `/admin/queue`; replay is manual (a real system would automate it). |
-| **Worker crashes mid-batch** | Un-acked messages hit the visibility timeout and are redelivered. If the crash happened *after* the Mongo write but *before* the ack, redelivery is deduplicated (Redis claim, then unique index on `event_id` as backstop) — no double-writes. | None visible; processing latency blips. | Automatic. This is the standard at-least-once + idempotent-consumer pattern. |
+| **Worker crashes mid-batch** | Un-acked messages hit the visibility timeout and are redelivered. If the crash happened *after* the Mongo write but *before* the ack, redelivery is deduplicated (dedup marker written post-write, unique index on `event_id` as backstop) — no double-writes. If it crashed *before* the write, no marker exists, so the redelivery processes normally — no drops. | None visible; processing latency blips. | Automatic. This is the standard at-least-once + idempotent-consumer pattern. |
 | **Whole process crashes** | Queued (not-yet-written) events are lost — the queue is in-memory by design. | Silent loss of buffered events. | This is the documented gap vs real SQS; it's the #1 reason to swap the transport in production. |
 | **Elasticsearch down** | Worker logs the index failure and continues; events still land in Mongo and get acked. `/events/search` returns 503 (`search_unavailable`). | Search degraded; ingestion, filters, stats, realtime all unaffected. | ES returns → *new* events index normally. Events ingested during the outage are missing from ES until re-indexed from Mongo (manual backfill; see "differently"). |
 | **Redis down** | Realtime stats bypass the cache and compute from Mongo (`X-Cache: BYPASS`). Rate limiting fails open. Dedup fails open — the Mongo unique index still prevents duplicates. | Realtime endpoint slower; no 5xx. | Automatic on reconnect. Every Redis dependency is deliberately non-critical. |
@@ -244,9 +253,9 @@ Drop-in swap — what changes:
   main gap), independent scaling of producers/consumers, and operational
   tooling (CloudWatch depth/age alarms, DLQ redrive console).
 - **What I'd still own:** idempotent consumption. SQS standard queues are
-  at-least-once and can reorder — the dedup claim + unique index stay exactly
-  as they are. This is worth stating plainly: *moving to real SQS does not
-  buy exactly-once; the consumer-side idempotency is permanent.*
+  at-least-once and can reorder — the dedup check/mark + unique index stay
+  exactly as they are. This is worth stating plainly: *moving to real SQS does
+  not buy exactly-once; the consumer-side idempotency is permanent.*
 - **What I'd reconsider:** FIFO queues (per-`user_id` `MessageGroupId`) if
   ordering ever became a product requirement — accepting the ~300 msg/s/group
   throughput cost. For analytics events, standard + idempotency is the better
@@ -286,3 +295,16 @@ Given more time or a real production environment:
 8. **Security.** The API is currently unauthenticated (out of assessment
    scope): API keys or OAuth client credentials on ingest, plus per-tenant
    rate limits instead of per-IP.
+9. **POST-boundary idempotency.** Today the contract is: a client-supplied
+   `event_id` is an idempotency key (duplicates collapse to one event);
+   without one, identical payloads are *distinct* events — a deliberate
+   choice, pinned by an integration test. The alternative considered was
+   content-hash dedup (hash of type+timestamp+user+url+metadata as the
+   default `event_id`): it absorbs HTTP retries without client cooperation,
+   but silently merges legitimately identical events (two clicks in the same
+   second), which is a business decision the server shouldn't guess. The
+   middle ground I'd ship in production: keep the client key as the contract
+   and add a short-TTL content-hash window (~minutes) at the API layer that
+   detects *retries* specifically — in a separate Redis namespace from the
+   worker's dedup markers, since sharing a key would make the worker drop
+   the first legitimate delivery.

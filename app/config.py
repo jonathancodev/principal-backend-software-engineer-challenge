@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     es_index: str = "events"
     redis_url: str = "redis://localhost:6379/0"
 
+    # Store timeouts: bounded waits are what make the documented fail-open /
+    # degraded paths reachable — a hung store must become an error, not a hang.
+    mongo_server_selection_timeout_ms: int = 5000
+    es_request_timeout_seconds: float = 10.0
+    redis_socket_timeout_seconds: float = 2.0
+
     # --- Queue / worker ---
     queue_max_size: int = 10_000
     visibility_timeout_seconds: float = 30.0

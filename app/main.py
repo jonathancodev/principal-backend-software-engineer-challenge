@@ -60,10 +60,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         setup_logging(settings.log_level)
 
         mongo_client: AsyncMongoClient = AsyncMongoClient(
-            settings.mongo_uri, tz_aware=True, serverSelectionTimeoutMS=5000
+            settings.mongo_uri,
+            tz_aware=True,
+            serverSelectionTimeoutMS=settings.mongo_server_selection_timeout_ms,
         )
-        es_client = AsyncElasticsearch(settings.es_url, request_timeout=10)
-        redis = Redis.from_url(settings.redis_url, decode_responses=True)
+        es_client = AsyncElasticsearch(
+            settings.es_url, request_timeout=settings.es_request_timeout_seconds
+        )
+        # Socket timeouts are load-bearing: without them a frozen Redis hangs
+        # callers forever instead of tripping the RedisError fail-open paths.
+        redis = Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=settings.redis_socket_timeout_seconds,
+        )
 
         repository = MongoEventRepository(mongo_client, settings.mongo_db)
         search_store = ElasticEventStore(es_client, settings.es_index)

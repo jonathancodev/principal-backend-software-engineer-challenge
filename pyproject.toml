@@ -33,4 +33,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: requires MongoDB, Elasticsearch and Redis to be reachable",
+    "chaos: pauses docker-compose containers to exercise failure modes; opt in with CHAOS=1",
 ]
